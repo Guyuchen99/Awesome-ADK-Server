@@ -31,7 +31,7 @@ app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://ycgraphixs-dev.myshopify.com",
+        "https://markv3.myshopify.com",
         "https://localhost:3458",
     ],
     allow_credentials=True,
