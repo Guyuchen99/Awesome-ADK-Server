@@ -31,8 +31,8 @@ app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://markv3.myshopify.com",
-        "https://localhost:3458",
+        "https://ycgraphixs-dev.myshopify.com",
+        "http://127.0.0.1:5500",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -88,7 +88,14 @@ async def inject_agent_message(session_id: str, message: str):
     try:
         invocation_id = f"e-{uuid.uuid4()}"
 
-        model_message = json.dumps({"message": message, "suggestions": []})
+        model_message = json.dumps(
+            {
+                "message": message,
+                "productComponent": None,
+                "tableComponent": None,
+                "suggestions": {"type": "default", "payload": []},
+            }
+        )
 
         client.agent_engines.sessions.events.append(
             name=f"{AGENT_ENGINE_BASE_URL}/sessions/{session_id}",
