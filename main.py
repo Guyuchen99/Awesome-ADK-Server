@@ -4,26 +4,31 @@ import uuid
 import datetime
 import vertexai
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Body
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Dict, Any
+from typing import Dict, List, Any
 
 load_dotenv()
 
 PORT = int(os.getenv("PORT", 8000))
 PROJECT_ID = os.getenv("PROJECT_ID")
 LOCATION = os.getenv("LOCATION")
-RESOURCE_ID = os.getenv("RESOURCE_ID")
+RESOURCE_ID_AGENT = os.getenv("RESOURCE_ID_AGENT")
+RESOURCE_ID_ADVISOR = os.getenv("RESOURCE_ID_ADVISOR")
 
 AGENT_ENGINE_BASE_URL = (
-    f"projects/{PROJECT_ID}/locations/{LOCATION}/reasoningEngines/{RESOURCE_ID}"
+    f"projects/{PROJECT_ID}/locations/{LOCATION}/reasoningEngines/{RESOURCE_ID_AGENT}"
 )
 
-if not all([PROJECT_ID, LOCATION, RESOURCE_ID]):
+ADVISOR_ENGINE_BASE_URL = (
+    f"projects/{PROJECT_ID}/locations/{LOCATION}/reasoningEngines/{RESOURCE_ID_ADVISOR}"
+)
+
+if not all([PROJECT_ID, LOCATION, RESOURCE_ID_AGENT, RESOURCE_ID_ADVISOR]):
     raise RuntimeError(
-        "Missing environment variables: PROJECT_ID, LOCATION, or RESOURCE_ID"
+        "Missing environment variables: PROJECT_ID, LOCATION, RESOURCE_ID_AGENT, or RESOURCE_ID_ADVISOR"
     )
 
 app = FastAPI()
@@ -44,8 +49,16 @@ class AgentResponse(BaseModel):
     data: Dict[str, Any]
 
 
-@app.post("/api/chat/{user_id}/create-session", response_model=AgentResponse)
-async def create_session(user_id: str, cart_id: str):
+class AdvisorResponse(BaseModel):
+    success: bool
+    data: Dict[str, Any]
+
+
+@app.post("/api/chat/{user_id}/create-agent-session", response_model=AgentResponse)
+async def create_agent_session(
+    user_id: str,
+    cart_id: str = Body(..., embed=True),
+):
     try:
         session = client.agent_engines.sessions.create(
             name=AGENT_ENGINE_BASE_URL,
@@ -59,6 +72,7 @@ async def create_session(user_id: str, cart_id: str):
         initialize_state = vertexai.types.EventActions(
             state_delta={"cart_id": f"gid://shopify/Cart/{cart_id}"}
         )
+
         config = vertexai.types.AppendAgentEngineSessionEventConfig(
             actions=initialize_state
         )
@@ -72,16 +86,19 @@ async def create_session(user_id: str, cart_id: str):
         )
 
         print(
-            f"✅ NOTE: /api/chat/{user_id}/create-session returned: {{'sessionId': '{session_id}'}}"
+            f"✅ NOTE: /api/chat/{user_id}/create-agent-session returned: {{'sessionId': '{session_id}'}}"
         )
         return AgentResponse(success=True, data={"sessionId": session_id})
     except Exception as e:
-        print(f"❌ ERROR: /api/chat/{user_id}/create-session failed: {e}")
+        print(f"❌ ERROR: /api/chat/{user_id}/create-agent-session failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/api/chat/{session_id}/inject-agent-message", response_model=AgentResponse)
-async def inject_agent_message(session_id: str, message: str):
+async def inject_agent_message(
+    session_id: str,
+    message: str = Body(..., embed=True),
+):
     try:
         invocation_id = f"e-{uuid.uuid4()}"
 
@@ -105,22 +122,71 @@ async def inject_agent_message(session_id: str, message: str):
         )
 
         print(
-            f"✅ NOTE: /api/chat/{session_id}/inject-agent-message returned: {{'injectedAgentMessage': '{message}'}}"
+            f"✅ NOTE: /api/chat/{session_id}/inject-agent-message returned: {{'injectedAgentMessage': '{model_message}'}}"
         )
-        return AgentResponse(success=True, data={"injectedAgentMessage": message})
+        return AgentResponse(success=True, data={"injectedAgentMessage": model_message})
     except Exception as e:
         print(f"❌ ERROR: /api/chat/{session_id}/inject-agent-message failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/api/chat/{user_id}/{session_id}/send-message")
-async def send_message(user_id: str, session_id: str, message: str):
+@app.post(
+    "/api/chat/{session_id}/inject-agent-message-from-advisor",
+    response_model=AgentResponse,
+)
+async def inject_agent_message_from_advisor(
+    session_id: str,
+    message: str = Body(..., embed=True),
+    suggestions: List[str] = Body(..., embed=True),
+):
+    try:
+        invocation_id = f"e-{uuid.uuid4()}"
+
+        model_message = json.dumps(
+            {
+                "message": message,
+                "productComponent": None,
+                "tableComponent": None,
+                "suggestions": {"type": "default", "payload": suggestions},
+            }
+        )
+
+        client.agent_engines.sessions.events.append(
+            name=f"{AGENT_ENGINE_BASE_URL}/sessions/{session_id}",
+            author="shopify_agent",
+            invocation_id=invocation_id,
+            timestamp=datetime.datetime.now(tz=datetime.timezone.utc),
+            config={
+                "content": {"role": "model", "parts": [{"text": model_message}]},
+            },
+        )
+
+        print(
+            f"✅ NOTE: /api/chat/{session_id}/inject-agent-message-from-advisor returned: {{'injectedAgentMessage': '{model_message}'}}"
+        )
+        return AgentResponse(success=True, data={"injectedAgentMessage": model_message})
+    except Exception as e:
+        print(
+            f"❌ ERROR: /api/chat/{session_id}/inject-agent-message-from-advisor failed: {e}"
+        )
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post(
+    "/api/chat/{user_id}/{session_id}/send-agent-message",
+    response_class=StreamingResponse,
+)
+async def send_agent_message(
+    user_id: str,
+    session_id: str,
+    message: str = Body(..., embed=True),
+):
     try:
         adk_application = client.agent_engines.get(name=AGENT_ENGINE_BASE_URL)
 
         async def event_stream():
             print(
-                f"✅ NOTE: /api/chat/{user_id}/{session_id}/send-message streaming started."
+                f"✅ NOTE: /api/chat/{user_id}/{session_id}/send-agent-message streaming started."
             )
 
             async for event in adk_application.async_stream_query(
@@ -131,17 +197,20 @@ async def send_message(user_id: str, session_id: str, message: str):
                 print(f"🟢 EVENT: {json.dumps(event, indent=2)}")
                 yield f"data: {json.dumps(event)}\n\n"
 
-        print(
-            f"✅ NOTE: /api/chat/{user_id}/{session_id}/send-message streaming ended."
-        )
+            print(
+                f"✅ NOTE: /api/chat/{user_id}/{session_id}/send-agent-message streaming ended."
+            )
+
         return StreamingResponse(event_stream(), media_type="text/event-stream")
     except Exception as e:
-        print(f"❌ ERROR: /api/chat/{user_id}/{session_id}/send-message failed: {e}")
+        print(
+            f"❌ ERROR: /api/chat/{user_id}/{session_id}/send-agent-message failed: {e}"
+        )
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/api/chat/{user_id}/latest-session", response_model=AgentResponse)
-async def get_latest_session(user_id: str):
+@app.get("/api/chat/{user_id}/latest-agent-session", response_model=AgentResponse)
+async def get_latest_agent_session(user_id: str):
     try:
         latest_session_id = None
 
@@ -153,16 +222,16 @@ async def get_latest_session(user_id: str):
             break
 
         print(
-            f"✅ NOTE: /api/chat/{user_id}/latest-session returned: {{'latestSessionId': '{latest_session_id}'}}"
+            f"✅ NOTE: /api/chat/{user_id}/latest-agent-session returned: {{'latestSessionId': '{latest_session_id}'}}"
         )
         return AgentResponse(success=True, data={"latestSessionId": latest_session_id})
     except Exception as e:
-        print(f"❌ ERROR: /api/chat/{user_id}/latest-session failed: {e}")
+        print(f"❌ ERROR: /api/chat/{user_id}/latest-agent-session failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/api/chat/{session_id}/history", response_model=AgentResponse)
-async def get_history(session_id: str):
+@app.get("/api/chat/{session_id}/agent-history", response_model=AgentResponse)
+async def get_agent_history(session_id: str):
     try:
         session_history = []
 
@@ -191,9 +260,88 @@ async def get_history(session_id: str):
             session_history.append(event)
 
         print(
-            f"✅ NOTE: /api/chat/{session_id}/history returned: {{'sessionEvents': '{session_history}'}}"
+            f"✅ NOTE: /api/chat/{session_id}/agent-history returned: {{'sessionEvents': '{session_history}'}}"
         )
         return AgentResponse(success=True, data={"sessionEvents": session_history})
     except Exception as e:
-        print(f"❌ ERROR: /api/chat/{session_id}/history failed: {e}")
+        print(f"❌ ERROR: /api/chat/{session_id}/agent-history failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/chat/{user_id}/create-advisor-session", response_model=AdvisorResponse)
+async def create_advisor_session(user_id: str):
+    try:
+        session = client.agent_engines.sessions.create(
+            name=ADVISOR_ENGINE_BASE_URL,
+            user_id=user_id,
+        )
+
+        session_id = session.response.name.split("/sessions/")[-1]
+
+        print(
+            f"✅ NOTE: /api/chat/{user_id}/create-advisor-session returned: {{'sessionId': '{session_id}'}}"
+        )
+        return AdvisorResponse(success=True, data={"sessionId": session_id})
+    except Exception as e:
+        print(f"❌ ERROR: /api/chat/{user_id}/create-advisor-session failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post(
+    "/api/chat/{user_id}/{session_id}/send-advisor-message",
+    response_class=StreamingResponse,
+)
+async def send_advisor_message(
+    user_id: str,
+    session_id: str,
+    message: str = Body(..., embed=True),
+):
+    try:
+        adk_application = client.agent_engines.get(name=ADVISOR_ENGINE_BASE_URL)
+
+        async def event_stream():
+            print(
+                f"✅ NOTE: /api/chat/{user_id}/{session_id}/send-advisor-message streaming started."
+            )
+
+            async for event in adk_application.async_stream_query(
+                user_id=user_id,
+                session_id=session_id,
+                message=message,
+            ):
+                print(f"🟢 EVENT: {json.dumps(event, indent=2)}")
+                yield f"data: {json.dumps(event)}\n\n"
+
+            print(
+                f"✅ NOTE: /api/chat/{user_id}/{session_id}/send-advisor-message streaming ended."
+            )
+
+        return StreamingResponse(event_stream(), media_type="text/event-stream")
+    except Exception as e:
+        print(
+            f"❌ ERROR: /api/chat/{user_id}/{session_id}/send-advisor-message failed: {e}"
+        )
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/chat/{user_id}/latest-advisor-session", response_model=AdvisorResponse)
+async def get_latest_advisor_session(user_id: str):
+    try:
+        latest_session_id = None
+
+        for session in client.agent_engines.sessions.list(
+            name=ADVISOR_ENGINE_BASE_URL,
+            config={"filter": f"user_id={user_id}"},
+        ):
+            latest_session_id = session.name.split("/sessions/")[-1]
+            break
+
+        print(
+            f"✅ NOTE: /api/chat/{user_id}/latest-advisor-session returned: {{'latestSessionId': '{latest_session_id}'}}"
+        )
+        return AdvisorResponse(
+            success=True, data={"latestSessionId": latest_session_id}
+        )
+    except Exception as e:
+        print(f"❌ ERROR: /api/chat/{user_id}/latest-advisor-session failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
